@@ -1,6 +1,7 @@
 import sys, json, ctypes, subprocess, os, time, webbrowser
 from pathlib import Path
 import numpy as np
+from PIL import Image
 
 import trimesh
 import moderngl
@@ -77,7 +78,6 @@ class ToastWindow(QWidget):
         screen = QApplication.primaryScreen().size()
         w = screen.width() // 3
         h = 50
-        # 放在屏幕上方居中，位置与进度条类似
         self.setGeometry((screen.width() - w) // 2, 20, w, h)
         
         layout = QVBoxLayout(self)
@@ -116,7 +116,7 @@ class ToastWindow(QWidget):
             ToastWindow._instances.remove(self)
         super().closeEvent(event)
 
-# ================= 模型丢失选择窗 =================
+# ================= 弹窗 =================
 class MissingModelDialog(QDialog):
     def __init__(self):
         super().__init__()
@@ -132,6 +132,32 @@ class MissingModelDialog(QDialog):
         btn_layout = QHBoxLayout()
         btn_choose = QPushButton("选择")
         btn_close = QPushButton("关闭")
+        
+        btn_choose.setStyleSheet("QPushButton { background-color: #00bfff; color: black; padding: 6px; border-radius: 4px; }")
+        btn_close.setStyleSheet("QPushButton { background-color: #555; color: white; padding: 6px; border-radius: 4px; }")
+        
+        btn_choose.clicked.connect(self.accept)
+        btn_close.clicked.connect(self.reject)
+        
+        btn_layout.addWidget(btn_choose)
+        btn_layout.addWidget(btn_close)
+        layout.addLayout(btn_layout)
+
+class AskTextureDialog(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("提示")
+        self.setFixedSize(340, 150)
+        self.setStyleSheet("QDialog { background-color: #2b2b2b; } QLabel { color: #e0e0e0; font-family: 'Microsoft YaHei'; font-size: 13px; }")
+        
+        layout = QVBoxLayout(self)
+        label = QLabel("未检测到模型自带的 .mtl 材质文件。\n是否手动选择一张纹理贴图？", self)
+        label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(label)
+        
+        btn_layout = QHBoxLayout()
+        btn_choose = QPushButton("选择图片")
+        btn_close = QPushButton("使用纯色")
         
         btn_choose.setStyleSheet("QPushButton { background-color: #00bfff; color: black; padding: 6px; border-radius: 4px; }")
         btn_close.setStyleSheet("QPushButton { background-color: #555; color: white; padding: 6px; border-radius: 4px; }")
@@ -374,12 +400,22 @@ class ConfigDialog(QDialog):
             path, _ = QFileDialog.getOpenFileName(self, "选择 .obj 模型", str(Path.home()), "OBJ (*.obj)")
             if path:
                 data["model_path"] = path.replace("\\", "/")
+                data["custom_texture"] = ""
+                
+                # 核心修复：强制检测是否需要询问贴图
+                if not check_model_has_texture(path):
+                    dlg = AskTextureDialog()
+                    if dlg.exec() == QDialog.Accepted:
+                        tex, _ = QFileDialog.getOpenFileName(self, "选择纹理贴图", str(Path(path).parent), "Image Files (*.png *.jpg *.jpeg *.bmp)")
+                        if tex:
+                            data["custom_texture"] = tex.replace("\\", "/")
+                            
                 DATA_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
                 if self.parent() and hasattr(self.parent(), 'reload_model'):
                     self.parent().reload_model()
                 ToastWindow("模型已更换", 1000).show()
-        except Exception:
-            ToastWindow("操作失败", 1000).show()
+        except Exception as e:
+            ToastWindow(f"操作失败: {e}", 2000).show()
 
     def clear_data(self):
         reply = QMessageBox.question(self, "确认", "真的要清除所有应用数据吗？", QMessageBox.Yes | QMessageBox.No)
@@ -399,10 +435,46 @@ class ConfigDialog(QDialog):
             except Exception:
                 ToastWindow("操作失败", 1000).show()
 
-# ================= 模型加载数据准备 =================
-def build_mesh_data(path, current_cfg):
-    m = trimesh.load(path, force='mesh')
-    if isinstance(m, trimesh.Scene): m = m.to_mesh()
+# ================= 模型与贴图加载逻辑 =================
+def check_model_has_texture(m_path):
+    # 暴力检查法：直接读文件源码看有没有 mtllib，防止 trimesh 生成假贴图
+    try:
+        if not m_path or not Path(m_path).exists(): 
+            return False
+            
+        with open(m_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read().lower()
+            if 'mtllib' not in content:
+                return False
+                
+        m = trimesh.load(m_path, force='mesh', skip_materials=False)
+        if isinstance(m, trimesh.Scene):
+            m = m.to_mesh()
+        if hasattr(m, 'visual') and hasattr(m.visual, 'material'):
+            mat = m.visual.material
+            if hasattr(mat, 'image') and mat.image is not None:
+                # 如果解析出了真实的大图片，才算真正有贴图
+                if mat.image.size[0] > 4 and mat.image.size[1] > 4:
+                    return True
+    except Exception:
+        pass
+    return False
+
+def build_mesh_data(path, custom_tex_path, current_cfg):
+    try:
+        m = trimesh.load(path, force='mesh')
+    except Exception as e:
+        raise RuntimeError(f"模型加载失败，文件可能已损坏。\n\n详细错误：{e}")
+        
+    if isinstance(m, trimesh.Scene): 
+        try:
+            m = m.to_mesh()
+        except Exception:
+            raise RuntimeError("模型包含多个网格且无法合并，请使用其他软件重新导出。")
+
+    if m is None or len(m.vertices) == 0 or len(m.faces) == 0:
+        raise RuntimeError("模型中不包含任何有效的顶点或面数据。")
+
     b = m.bounds
     ext = b[1] - b[0]
     md = max(ext)
@@ -418,18 +490,56 @@ def build_mesh_data(path, current_cfg):
         inertia_z = max((m.extents[0]**2 + m.extents[1]**2) / 12.0, 1500.0)
     m.apply_translation(-cm)
     
-    v = m.vertices[m.faces].reshape(-1, 3).astype('f4')
-    n = m.vertex_normals[m.faces].reshape(-1, 3).astype('f4')
+    try:
+        v = m.vertices[m.faces].reshape(-1, 3).astype('f4')
+        n = m.vertex_normals[m.faces].reshape(-1, 3).astype('f4')
+    except Exception as e:
+        raise RuntimeError(f"解析模型顶点失败：{e}")
+
     if hasattr(m.visual, 'uv') and m.visual.uv is not None:
         us = m.visual.uv.shape
-        uv = m.visual.uv.reshape(-1, 2).astype('f4') if us[0] == m.faces.shape[0] else m.visual.uv[m.faces].reshape(-1, 2).astype('f4')
+        if us[0] == m.faces.shape[0]:
+            uv = m.visual.uv.reshape(-1, 2).astype('f4')
+        elif us[0] == m.vertices.shape[0]:
+            uv = m.visual.uv[m.faces].reshape(-1, 2).astype('f4')
+        else:
+            uv = np.zeros((len(v), 2), dtype='f4')
     else:
         uv = np.zeros((len(v), 2), dtype='f4')
         
     tex_img = None
-    if hasattr(m.visual, 'material') and hasattr(m.visual.material, 'image'):
-        tex_img = m.visual.material.image
+    # 优先使用用户自定义的贴图
+    if custom_tex_path and Path(custom_tex_path).exists():
+        try:
+            tex_img = Image.open(custom_tex_path)
+        except Exception:
+            pass
+            
+    if tex_img is None:
+        if hasattr(m.visual, 'material') and hasattr(m.visual.material, 'image'):
+            img = m.visual.material.image
+            if img and img.size[0] > 4: # 排除假贴图
+                tex_img = img
+                
     return v, n, uv, inertia_z, tex_img
+
+def load_json_safe(path, default_dict):
+    if not path.exists():
+        path.write_text(json.dumps(default_dict, indent=2, ensure_ascii=False), encoding="utf-8")
+        return default_dict.copy()
+    try:
+        content = path.read_text(encoding="utf-8")
+        data_loaded = json.loads(content)
+        if not isinstance(data_loaded, dict):
+            raise ValueError("Not a dictionary")
+        for k, v in default_dict.items():
+            if k not in data_loaded:
+                data_loaded[k] = v
+        return data_loaded
+    except Exception:
+        path.unlink(missing_ok=True)
+        path.write_text(json.dumps(default_dict, indent=2, ensure_ascii=False), encoding="utf-8")
+        return default_dict.copy()
 
 # ================= 初始化 =================
 splash = SplashWindow()
@@ -437,13 +547,8 @@ splash.show()
 QApplication.processEvents()
 
 splash.set_status(10, "正在读取配置...")
-if not CONFIG_PATH.exists():
-    CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False), encoding="utf-8")
-cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-
-if not DATA_PATH.exists():
-    DATA_PATH.write_text(json.dumps({"model_path": "", "press_sound": "", "release_sound": ""}, indent=2), encoding="utf-8")
-data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+cfg = load_json_safe(CONFIG_PATH, DEFAULT_CONFIG)
+data = load_json_safe(DATA_PATH, {"model_path": "", "custom_texture": "", "press_sound": "", "release_sound": ""})
 
 splash.set_status(20, "正在检查模型文件...")
 if not data.get("model_path") or not Path(data["model_path"]).exists():
@@ -461,6 +566,19 @@ if not data.get("model_path") or not Path(data["model_path"]).exists():
     splash.show()
 
 model_path = data["model_path"]
+
+# 启动时的贴图询问逻辑
+if not data.get("custom_texture") or not Path(data["custom_texture"]).exists():
+    if not check_model_has_texture(model_path):
+        splash.hide()
+        tex_dlg = AskTextureDialog()
+        if tex_dlg.exec() == QDialog.Accepted:
+            tex_path, _ = QFileDialog.getOpenFileName(None, "选择纹理贴图", str(Path(model_path).parent), "Image Files (*.png *.jpg *.jpeg *.bmp)")
+            if tex_path:
+                data["custom_texture"] = tex_path.replace("\\", "/")
+                DATA_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        splash.show()
+
 mci = ctypes.windll.winmm.mciSendStringW
 
 def close_all_audio():
@@ -493,7 +611,13 @@ def get_rotation_matrix(wx, wy, wz, dt):
     ], dtype='f4')
 
 splash.set_status(40, "正在加载 3D 模型...")
-verts, normals, tex_uv, Iz, tex_image = build_mesh_data(model_path, cfg)
+
+try:
+    verts, normals, tex_uv, Iz, tex_image = build_mesh_data(model_path, data.get("custom_texture", ""), cfg)
+except Exception as e:
+    splash.hide()
+    QMessageBox.critical(None, "模型加载失败", str(e))
+    sys.exit(1)
 
 screen = app.primaryScreen().size()
 W = screen.width()
@@ -537,14 +661,18 @@ vao = ctx.vertex_array(prog, [(vbo_pos, '3f', 'in_pos'), (vbo_nrm, '3f', 'in_nor
 splash.set_status(80, "正在加载纹理...")
 tex = None
 if tex_image is not None:
-    img = tex_image.convert('RGBA')
-    img_data = np.array(img, dtype=np.uint8)
-    if cfg.get("flip_texture", True): img_data = np.flipud(img_data)
-    tw, th = img.size
-    tex = ctx.texture((tw, th), 4, img_data.tobytes())
-    tex.repeat_x = tex.repeat_y = False
-    tex.build_mipmaps(); tex.use(0)
-    prog['tex'] = 0; prog['has_tex'] = 1.0
+    try:
+        img = tex_image.convert('RGBA')
+        img_data = np.array(img, dtype=np.uint8)
+        if cfg.get("flip_texture", True): img_data = np.flipud(img_data)
+        tw, th = img.size
+        tex = ctx.texture((tw, th), 4, img_data.tobytes())
+        tex.repeat_x = tex.repeat_y = False
+        tex.build_mipmaps(); tex.use(0)
+        prog['tex'] = 0; prog['has_tex'] = 1.0
+    except Exception:
+        tex = None
+        prog['has_tex'] = 0.0
 else:
     prog['has_tex'] = 0.0
 
@@ -627,22 +755,31 @@ class Pet(QWidget):
         
         current_geom_cfg = (cfg["model_scale"], cfg["target_height_ratio"], cfg["flip_texture"])
         if self._last_geom_cfg != current_geom_cfg:
-            verts, normals, tex_uv, Iz, tex_image = build_mesh_data(model_path, cfg)
-            
+            try:
+                verts, normals, tex_uv, Iz, tex_image = build_mesh_data(model_path, data.get("custom_texture", ""), cfg)
+            except Exception as e:
+                ToastWindow(f"模型重载失败: {e}", 2000).show()
+                return
+                
             vbo_pos.write(verts.tobytes())
             vbo_nrm.write(normals.tobytes())
             vbo_uv.write(tex_uv.tobytes())
             
             if tex_image is not None:
-                img = tex_image.convert('RGBA')
-                img_data = np.array(img, dtype=np.uint8)
-                if cfg.get("flip_texture", True): img_data = np.flipud(img_data)
-                tw, th = img.size
-                if tex: tex.release()
-                tex = ctx.texture((tw, th), 4, img_data.tobytes())
-                tex.repeat_x = tex.repeat_y = False
-                tex.build_mipmaps(); tex.use(0)
-                prog['tex'] = 0; prog['has_tex'] = 1.0
+                try:
+                    img = tex_image.convert('RGBA')
+                    img_data = np.array(img, dtype=np.uint8)
+                    if cfg.get("flip_texture", True): img_data = np.flipud(img_data)
+                    tw, th = img.size
+                    if tex: tex.release()
+                    tex = ctx.texture((tw, th), 4, img_data.tobytes())
+                    tex.repeat_x = tex.repeat_y = False
+                    tex.build_mipmaps(); tex.use(0)
+                    prog['tex'] = 0; prog['has_tex'] = 1.0
+                except Exception:
+                    if tex: tex.release()
+                    tex = None
+                    prog['has_tex'] = 0.0
             else:
                 if tex: tex.release()
                 tex = None
@@ -662,22 +799,31 @@ class Pet(QWidget):
         global verts, normals, tex_uv, Iz, tex, model_path
         
         model_path = data["model_path"]
-        verts, normals, tex_uv, Iz, tex_image = build_mesh_data(model_path, cfg)
+        try:
+            verts, normals, tex_uv, Iz, tex_image = build_mesh_data(model_path, data.get("custom_texture", ""), cfg)
+        except Exception as e:
+            ToastWindow(f"模型加载失败: {e}", 3000).show()
+            return
         
         vbo_pos.write(verts.tobytes())
         vbo_nrm.write(normals.tobytes())
         vbo_uv.write(tex_uv.tobytes())
         
         if tex_image is not None:
-            img = tex_image.convert('RGBA')
-            img_data = np.array(img, dtype=np.uint8)
-            if cfg.get("flip_texture", True): img_data = np.flipud(img_data)
-            tw, th = img.size
-            if tex: tex.release()
-            tex = ctx.texture((tw, th), 4, img_data.tobytes())
-            tex.repeat_x = tex.repeat_y = False
-            tex.build_mipmaps(); tex.use(0)
-            prog['tex'] = 0; prog['has_tex'] = 1.0
+            try:
+                img = tex_image.convert('RGBA')
+                img_data = np.array(img, dtype=np.uint8)
+                if cfg.get("flip_texture", True): img_data = np.flipud(img_data)
+                tw, th = img.size
+                if tex: tex.release()
+                tex = ctx.texture((tw, th), 4, img_data.tobytes())
+                tex.repeat_x = tex.repeat_y = False
+                tex.build_mipmaps(); tex.use(0)
+                prog['tex'] = 0; prog['has_tex'] = 1.0
+            except Exception:
+                if tex: tex.release()
+                tex = None
+                prog['has_tex'] = 0.0
         else:
             if tex: tex.release()
             tex = None
